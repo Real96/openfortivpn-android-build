@@ -1,0 +1,228 @@
+name: build-forti-android
+
+on:
+  push:
+    paths-ignore: ['**.md']
+  workflow_dispatch:
+    inputs:
+      openssl_tag:
+        description: "OpenSSL tag (empty = latest)"
+        required: false
+      ppp_tag:
+        description: "ppp tag (2.5.3 will break ip-up/ip-down)"
+        required: false
+        default: v2.5.2
+      ofv_tag:
+        description: "openfortivpn tag (empty = latest)"
+        required: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      CROSS: aarch64-unknown-linux-musl
+    steps:
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential autoconf automake libtool \
+                                  pkg-config git wget xz-utils perl file
+
+      - name: Resolve source versions
+        id: ver
+        run: |
+          OSSL_URL=https://github.com/openssl/openssl.git
+          PPP_URL=https://github.com/ppp-project/ppp.git
+          OFV_URL=https://github.com/adrienverge/openfortivpn.git
+
+          echo "=== openssl: last 10 tags matching the filter ==="
+          git ls-remote --tags --refs "$OSSL_URL" 'openssl-*' \
+            | sed 's#.*refs/tags/##' | grep -E '^openssl-[0-9]+(\.[0-9]+)*$' | sort -V | tail -10
+          echo "=== ppp: last 10 tags (both naming schemes) ==="
+          git ls-remote --tags --refs "$PPP_URL" 'v*' 'ppp-*' \
+            | sed 's#.*refs/tags/##' | sort -V | tail -10
+          echo "=== openfortivpn: last 10 tags matching the filter ==="
+          git ls-remote --tags --refs "$OFV_URL" 'v*' \
+            | sed 's#.*refs/tags/##' | grep -E '^v[0-9]+(\.[0-9]+)*$' | sort -V | tail -10
+
+          OSSL="${{ github.event.inputs.openssl_tag }}"
+          if [ -z "$OSSL" ]; then
+            OSSL=$(git ls-remote --tags --refs "$OSSL_URL" 'openssl-*' \
+                   | sed 's#.*refs/tags/##' \
+                   | grep -E '^openssl-[0-9]+(\.[0-9]+)*$' | sort -V | tail -1)
+          fi
+
+          PPP="${{ github.event.inputs.ppp_tag }}"
+          if [ -z "$PPP" ]; then
+            # ppp switched naming from "ppp-2.5.1" to "v2.5.2": normalize, sort, then restore
+            PPP=$(git ls-remote --tags --refs "$PPP_URL" 'v*' 'ppp-*' \
+                  | sed 's#.*refs/tags/##; s#^ppp-#v#' \
+                  | grep -E '^v[0-9]+(\.[0-9]+)*$' | sort -V | tail -1)
+            if [ -n "$PPP" ] && ! git ls-remote --tags --refs "$PPP_URL" "$PPP" | grep -q .; then
+              PPP=$(echo "$PPP" | sed 's#^v#ppp-#')
+            fi
+          fi
+
+          OFV="${{ github.event.inputs.ofv_tag }}"
+          if [ -z "$OFV" ]; then
+            OFV=$(git ls-remote --tags --refs "$OFV_URL" 'v*' \
+                  | sed 's#.*refs/tags/##' \
+                  | grep -E '^v[0-9]+(\.[0-9]+)*$' | sort -V | tail -1)
+          fi
+
+          echo "=== resolved: OpenSSL=$OSSL  ppp=$PPP  openfortivpn=$OFV ==="
+          for v in "$OSSL" "$PPP" "$OFV"; do
+            [ -n "$v" ] || { echo "ERROR: version resolution failed"; exit 1; }
+          done
+
+          echo "ossl=$OSSL" >> $GITHUB_OUTPUT
+          echo "ppp=$PPP"   >> $GITHUB_OUTPUT
+          echo "ofv=$OFV"   >> $GITHUB_OUTPUT
+
+      - name: Cache toolchain
+        id: cache-tc
+        uses: actions/cache@v4
+        with:
+          path: ~/x-tools
+          key: musl-aarch64-v1
+
+      - name: Download musl toolchain
+        if: steps.cache-tc.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/x-tools
+          wget -q https://github.com/cross-tools/musl-cross/releases/latest/download/aarch64-unknown-linux-musl.tar.xz -O /tmp/tc.tar.xz
+          tar -xf /tmp/tc.tar.xz -C ~/x-tools
+
+      - name: Set up environment
+        run: |
+          echo "$HOME/x-tools/${CROSS}/bin" >> $GITHUB_PATH
+          echo "PREFIX=$HOME/sysroot" >> $GITHUB_ENV
+
+      - name: Verify toolchain
+        run: ${CROSS}-gcc --version
+
+      - name: Cache OpenSSL
+        id: cache-ssl
+        uses: actions/cache@v4
+        with:
+          path: ~/sysroot
+          key: openssl-${{ steps.ver.outputs.ossl }}-musl-aarch64-v1
+
+      - name: Build static OpenSSL
+        if: steps.cache-ssl.outputs.cache-hit != 'true'
+        run: |
+          TAG="${{ steps.ver.outputs.ossl }}"
+          [ -n "$TAG" ] || { echo "ERROR: empty openssl tag"; exit 1; }
+          git clone --depth 1 --branch "$TAG" https://github.com/openssl/openssl.git
+          cd openssl
+          ./Configure linux-aarch64 no-shared no-dso no-engine no-tests \
+            --prefix=$PREFIX --cross-compile-prefix=${CROSS}-
+          make -j$(nproc)
+          make install_sw
+
+      - name: Build static pppd
+        run: |
+          TAG="${{ steps.ver.outputs.ppp }}"
+          [ -n "$TAG" ] || { echo "ERROR: empty ppp tag"; exit 1; }
+          git clone --depth 1 --branch "$TAG" https://github.com/ppp-project/ppp.git
+          cd ppp
+          # K&R declaration incompatible with C23; shadow.h already provides the prototype
+          sed -i '/struct spwd \*getspnam();/d' pppd/session.c
+          ./autogen.sh
+          ./configure --host=${CROSS} --prefix=/data/local \
+            --sysconfdir=/data/local/etc --runstatedir=/data/local/var/run \
+            --disable-shared --enable-static --disable-plugins \
+            --with-openssl=$PREFIX \
+            CC=${CROSS}-gcc CFLAGS="-Os -std=gnu17 -I$PREFIX/include" \
+            LDFLAGS="-L$PREFIX/lib" \
+            || { tail -60 config.log; exit 1; }
+          # build only the pppd directory: -all-static is a libtool-only flag
+          make -C pppd -j$(nproc) LDFLAGS="-all-static -L$PREFIX/lib"
+          PPPD=$(find . -type f -name pppd -exec sh -c 'file -b "$1" | grep -q ELF' _ {} \; -print | head -1)
+          echo "binary: $PPPD"; file "$PPPD"
+          if ! file "$PPPD" | grep -q "statically linked"; then
+            echo "!!! still dynamic, retrying with forced pppd_LDFLAGS"
+            rm -f pppd/pppd pppd/.libs/pppd
+            make -C pppd -j$(nproc) LDFLAGS="-L$PREFIX/lib" pppd_LDFLAGS="-all-static"
+            PPPD=$(find . -type f -name pppd -exec sh -c 'file -b "$1" | grep -q ELF' _ {} \; -print | head -1)
+            file "$PPPD"
+            file "$PPPD" | grep -q "statically linked" || exit 1
+          fi
+
+      - name: Build static openfortivpn
+        run: |
+          TAG="${{ steps.ver.outputs.ofv }}"
+          [ -n "$TAG" ] || { echo "ERROR: empty openfortivpn tag"; exit 1; }
+          git clone --depth 1 --branch "$TAG" https://github.com/adrienverge/openfortivpn.git
+          cd openfortivpn
+          ./autogen.sh
+          # AC_CHECK_FILE cannot probe the target when cross compiling: prime the cache
+          cat > cross.cache <<'EOF'
+          ac_cv_file__proc_net_route=yes
+          ac_cv_file__proc_net_ipv6_route=yes
+          ac_cv_file__usr_sbin_netstat=no
+          ac_cv_file__usr_bin_netstat=no
+          ac_cv_file__usr_sbin_ppp=no
+          ac_cv_file__usr_sbin_pppd=yes
+          ac_cv_file__usr_sbin_resolvconf=no
+          ac_cv_file__sbin_resolvconf=no
+          ac_cv_file__data_local_bin_pppd=yes
+          EOF
+          ./configure --host=${CROSS} --prefix=/data/local \
+            --sysconfdir=/data/local/etc \
+            --with-pppd=/data/local/bin/pppd \
+            --cache-file=cross.cache \
+            CC=${CROSS}-gcc CFLAGS="-Os -I$PREFIX/include" \
+            LDFLAGS="-static -L$PREFIX/lib" \
+            PKG_CONFIG_PATH=$PREFIX/lib/pkgconfig \
+            || { tail -60 config.log; exit 1; }
+          make -j$(nproc)
+
+      - name: Collect and verify binaries
+        run: |
+          mkdir -p out
+          PPPD=$(find ppp -type f -name pppd -exec sh -c 'file -b "$1" | grep -q ELF' _ {} \; -print | head -1)
+          cp "$PPPD" out/pppd
+          cp openfortivpn/openfortivpn out/openfortivpn
+          ${CROSS}-strip out/pppd out/openfortivpn
+          file out/*
+          # fail the build if either binary is not fully static
+          file out/openfortivpn | grep -q "statically linked"
+          file out/pppd        | grep -q "statically linked"
+          ls -lh out/
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: forti-android-aarch64
+          path: out/
+
+      - name: Publish "latest" release
+        if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          # drop the previous release and tag (ignore errors if they do not exist)
+          gh release delete latest --yes --cleanup-tag || true
+          gh api -X DELETE "repos/${GITHUB_REPOSITORY}/git/refs/tags/latest" || true
+          sleep 3
+          NOTES="Static aarch64 binaries for Android.
+          commit: ${GITHUB_SHA}
+          openssl: ${{ steps.ver.outputs.ossl }}
+          ppp: ${{ steps.ver.outputs.ppp }}
+          openfortivpn: ${{ steps.ver.outputs.ofv }}"
+          if ! gh release create latest out/pppd out/openfortivpn \
+                 --target "$GITHUB_SHA" \
+                 --title "Latest build - $(date -u '+%Y-%m-%d %H:%M') UTC" \
+                 --notes "$NOTES"; then
+            echo "create failed, updating the existing release instead"
+            gh release upload latest out/pppd out/openfortivpn --clobber
+          fi
